@@ -12,6 +12,12 @@ Simulator slice and an `arm64` iOS device slice.
 
 See `./xcframework-to-fat --help` for more info.
 
+# Installation
+
+```sh
+brew install keith/formulae/xcframework-to-fat
+```
+
 ## Notes
 
 - You cannot use this in the case you actually need multiple
