@@ -1,0 +1,190 @@
+#!/usr/bin/python3 -s
+
+from typing import Any, Dict, List, Optional, Set
+import argparse
+import glob
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+_VALID_PLATFORMS = {"watchos", "ios", "tvos", "macosx"}
+_VALID_ARCHS = {"i386", "arm64", "arm64e", "x86_64", "armv7s", "armv7k"}
+_IGNORED_FILENAMES = {"_CodeSignature"}
+
+# Examples: x86_64-apple-ios11.0-simulator, arm64-apple-ios11.0
+class Triple:
+    def __init__(self, triple: str):
+        self._original = triple
+        parts = triple.split("-")
+        if len(parts) not in (2, 3, 4):
+            raise SystemExit(
+                f"error: invalid triple: '{triple}', expected arch-apple-platform[version][-simulator]"
+            )
+
+        self.arch = parts[0]
+        if self.arch not in _VALID_ARCHS:
+            raise SystemExit(
+                f"error: unexpected arch: '{self.arch}', expected one of: {', '.join(_VALID_ARCHS)}"
+            )
+
+        self.platform = parts[1]
+        if self.platform == "apple":
+            self.platform = parts[2]
+
+        self.platform = re.sub(r"[^a-z]+", "", self.platform)
+        if self.platform not in _VALID_PLATFORMS:
+            raise SystemExit(
+                f"error unexpected platform: {self.platform}, expected one of: {', '.join(_VALID_PLATFORMS)}"
+            )
+
+        self.is_simulator = parts[-1] == "simulator"
+
+    def __str__(self) -> str:
+        return self._original
+
+
+class Library:
+    def __init__(self, root: str, plist_definition: Dict[str, Any]):
+        self.name = os.path.splitext(plist_definition["LibraryPath"])[0]
+        self.framework_path: str = os.path.join(
+            root,
+            plist_definition["LibraryIdentifier"],
+            plist_definition["LibraryPath"],
+        )
+        self.binary_path = os.path.join(self.framework_path, self.name)
+        self.archs: Set[str] = set(plist_definition["SupportedArchitectures"])
+        self.platform: str = plist_definition["SupportedPlatform"]
+        self.is_simulator = (
+            plist_definition.get("SupportedPlatformVariant") == "simulator"
+        )
+
+    def matches(self, triple: Triple) -> bool:
+        return (
+            triple.platform == self.platform
+            and triple.arch in self.archs
+            and triple.is_simulator == self.is_simulator
+        )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "xcframework", help="The path to the .xcframework to process"
+    )
+    parser.add_argument(
+        "output_path", help="The directory to output the created .framework to"
+    )
+    parser.add_argument(
+        "triples",
+        nargs="+",
+        help="The slices of the xcframework to include in the output, ex: arm64-apple-ios11.0, x86_64-apple-ios11.0-simulator will include a x86_64 iOS simulator slice and a arm64 iOS device slice",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite the output framework if it already exists",
+    )
+    return parser
+
+
+def _process_xcframework(
+    xcframework: str,
+    output_path: str,
+    triple_strings: List[str],
+    overwrite: bool,
+) -> None:
+    if not os.path.isdir(xcframework):
+        raise SystemExit(f"error: {xcframework} doesn't exist")
+
+    framework_plist = os.path.join(xcframework, "Info.plist")
+    framework_name = os.path.splitext(os.path.basename(xcframework))[0]
+
+    os.makedirs(output_path, exist_ok=True)
+    output_framework_dir = os.path.join(
+        output_path, f"{framework_name}.framework"
+    )
+    if os.path.exists(output_framework_dir):
+        if overwrite:
+            shutil.rmtree(output_framework_dir)
+        else:
+            raise SystemExit(f"error: {output_framework_dir} already exists")
+    os.makedirs(output_framework_dir, exist_ok=True)
+
+    plist_contents = plistlib.load(open(framework_plist, "br"))
+    version = plist_contents["XCFrameworkFormatVersion"]
+    if version != "1.0":
+        raise SystemExit(f"error: unsupported xcframework version: {version}")
+
+    triples = [Triple(triple_string) for triple_string in triple_strings]
+    binaries_dir = tempfile.mkdtemp()
+
+    libraries = [
+        Library(xcframework, definition)
+        for definition in plist_contents["AvailableLibraries"]
+    ]
+    primary_framework_path = libraries[0].framework_path
+    for triple in triples:
+        found = False
+        for library in libraries:
+            if not library.matches(triple):
+                continue
+
+            found = True
+
+            # Prefer device slices for copying resources and headers since theoretically they could differ
+            if not triple.is_simulator:
+                primary_framework_path = library.framework_path
+
+            subprocess.check_call(
+                [
+                    "lipo",
+                    "-thin",
+                    triple.arch,
+                    "-output",
+                    os.path.join(
+                        binaries_dir, f"{library.name}_{triple.arch}"
+                    ),
+                    library.binary_path,
+                ]
+            )
+
+        if not found:
+            raise SystemExit(f"error: no library for triple: {triple}")
+
+    for filename in os.listdir(primary_framework_path):
+        if filename in _IGNORED_FILENAMES or filename == framework_name:
+            continue
+
+        potential_path = os.path.join(primary_framework_path, filename)
+        if os.path.isdir(potential_path):
+            shutil.copytree(
+                potential_path, os.path.join(output_framework_dir, filename)
+            )
+        elif os.path.exists(potential_path):
+            shutil.copy2(potential_path, output_framework_dir)
+
+    output_binary_path = os.path.join(output_framework_dir, framework_name)
+    binaries = glob.glob(os.path.join(binaries_dir, "*"))
+    subprocess.check_call(
+        [
+            "lipo",
+            "-create",
+            "-output",
+            output_binary_path,
+        ]
+        + binaries
+    )
+    subprocess.check_call(
+        ["codesign", "--remove-signature", output_framework_dir]
+    )
+
+
+if __name__ == "__main__":
+    args = _build_parser().parse_args()
+    _process_xcframework(
+        args.xcframework, args.output_path, args.triples, args.overwrite
+    )
